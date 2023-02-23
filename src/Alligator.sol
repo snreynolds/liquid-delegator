@@ -16,11 +16,23 @@ struct Rules {
     uint16 blocksBeforeVoteCloses;
     address customRule;
 }
+// packed Rules nice
 
+// fractional delegations probably doable with an updated governor contract bc of this! ie call castVote(proposalId, support, numVotes) and can assign voter count by subdelegate
 contract Proxy is IERC1271 {
     address internal immutable owner;
     address internal immutable governor;
 
+    // every token holder deploys their own proxy, per governor
+    // only callable by alligator
+
+    // Maybe we actually want 1 Alligator for any governor. This could allow sharing rules potentially? Not w current design tho bc its rules per delegatee
+    // Would be cool to think about how you can share rules though.
+    // Could have subDelegations be per proxy address then.
+
+    // IE I want to use Alligator and establish a set of rules for all the DAOs and all delegatees I want to govern?
+
+    // deploy own proxy is a bit of a hurdle?
     constructor(address _governor) {
         owner = msg.sender;
         governor = _governor;
@@ -36,6 +48,7 @@ contract Proxy is IERC1271 {
     }
 
     fallback() external payable {
+        // default calls the governor contract
         require(msg.sender == owner);
         address addr = governor;
 
@@ -58,12 +71,16 @@ contract Alligator is ENSHelper {
     INounsDAOV2 public immutable governor;
 
     // From => To => Rules
+
+    // could update this with named mappings in 0.8.18 to make this a little more readable
+    // mapping (address from => mapping (address to => Rules rule))
     mapping(address => mapping(address => Rules)) public subDelegations;
     mapping(address => mapping(bytes32 => bool)) internal validSignatures;
 
     uint8 internal constant PERMISSION_VOTE = 0x01;
     uint8 internal constant PERMISSION_SIGN = 0x02;
     uint8 internal constant PERMISSION_PROPOSE = 0x04;
+    // potential to add new permission "types" depending on gov contract actions
 
     bytes32 internal constant DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
@@ -105,6 +122,7 @@ contract Alligator is ENSHelper {
     }
 
     function create(address owner) public returns (address endpoint) {
+        // proxy address determinitic by token owner
         bytes32 salt = bytes32(uint256(uint160(owner)));
         endpoint = address(new Proxy{salt: salt}(address(governor)));
         emit ProxyDeployed(owner, endpoint);
@@ -197,6 +215,9 @@ contract Alligator is ENSHelper {
         bytes32 r,
         bytes32 s
     ) external {
+        // might be nice to move to a lib to handle signing & typehashes
+        // OZ has a nice lib for handling domain seperator hashes that caches this and only updates in case chainId changes
+        // https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/cryptography/EIP712.sol
         bytes32 domainSeparator =
             keccak256(abi.encode(DOMAIN_TYPEHASH, keccak256("Alligator"), block.chainid, address(this)));
         bytes32 structHash = keccak256(abi.encode(BALLOT_TYPEHASH, proposalId, support));
@@ -236,6 +257,8 @@ contract Alligator is ENSHelper {
         return validSignatures[proxy][hash] ? IERC1271.isValidSignature.selector : bytes4(0);
     }
 
+    // could be nice to add a subDelegateBySig
+    // would allow submission of the delegation to be submitted by the delegatee (ie gas fees paid by delegatee)
     function subDelegate(address to, Rules calldata rules) external {
         address proxy = proxyAddress(msg.sender);
         if (proxy.code.length == 0) {
@@ -263,12 +286,16 @@ contract Alligator is ENSHelper {
         public
         view
     {
+        // authority is the chain of delegations
+        // how to prove that caller has the permissions to do gov actions
         address from = authority[0];
 
         if (from == sender) {
+            // owner has all permissions
             return;
         }
 
+        // heh this could be optimized if we had EIP-2330 extsload so we could just load relevant slots
         INounsDAOV2.ProposalCondensed memory proposal = governor.proposals(proposalId);
 
         for (uint256 i = 1; i < authority.length; i++) {
@@ -278,6 +305,8 @@ contract Alligator is ENSHelper {
             if ((rules.permissions & permissions) != permissions) {
                 revert NotDelegated(from, to, permissions);
             }
+            // min authority.length with a redelegation is 3.. ok
+            // just sanity checking
             if (rules.maxRedelegations + i + 1 < authority.length) {
                 revert TooManyRedelegations(from, to);
             }
@@ -290,6 +319,11 @@ contract Alligator is ENSHelper {
             if (rules.blocksBeforeVoteCloses != 0 && proposal.endBlock > block.number + rules.blocksBeforeVoteCloses) {
                 revert TooEarly(from, to, rules.blocksBeforeVoteCloses);
             }
+
+            // customRule is sweet, guess this is used for things like checking proposal spending etc
+            // but seems like this is a pretty big entry barrier for delegating, have to deploy a rules contract
+            // but there could be shared rules contracts? ie. Spending limit contract for nouns that checks a proposal transfers less than 100eth
+            // LOL ^ looks like you wrote one, I didn't see that until now
             if (rules.customRule != address(0)) {
                 bytes4 selector = IRule(rules.customRule).validate(address(governor), sender, proposalId, support);
                 if (selector != IRule.validate.selector) {
